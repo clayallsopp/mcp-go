@@ -16,6 +16,24 @@ import (
 	"github.com/google/uuid"
 )
 
+// SessionRegistry defines an interface for storing and retrieving sessions in a distributed environment
+type SessionRegistry interface {
+	// StoreSession stores session information
+	StoreSession(ctx context.Context, session *SSESession) error
+
+	// GetSession retrieves a session by ID
+	GetSession(ctx context.Context, sessionID string) (ClientSession, error)
+
+	// DeleteSession removes a session
+	DeleteSession(ctx context.Context, sessionID string) error
+
+	// SessionExists checks if a session exists
+	SessionExists(ctx context.Context, sessionID string) (bool, error)
+
+	// UpdateInitialized updates the initialized state of a session
+	UpdateInitialized(ctx context.Context, sessionID string, initialized bool) error
+}
+
 // SSESession represents an active SSE connection.
 type SSESession struct {
 	writer              http.ResponseWriter
