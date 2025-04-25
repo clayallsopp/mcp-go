@@ -16,8 +16,8 @@ import (
 	"github.com/google/uuid"
 )
 
-// sseSession represents an active SSE connection.
-type sseSession struct {
+// SSESession represents an active SSE connection.
+type SSESession struct {
 	writer              http.ResponseWriter
 	flusher             http.Flusher
 	done                chan struct{}
@@ -33,23 +33,23 @@ type sseSession struct {
 // content. This can be used to inject context values from headers, for example.
 type SSEContextFunc func(ctx context.Context, r *http.Request) context.Context
 
-func (s *sseSession) SessionID() string {
+func (s *SSESession) SessionID() string {
 	return s.sessionID
 }
 
-func (s *sseSession) NotificationChannel() chan<- mcp.JSONRPCNotification {
+func (s *SSESession) NotificationChannel() chan<- mcp.JSONRPCNotification {
 	return s.notificationChannel
 }
 
-func (s *sseSession) Initialize() {
+func (s *SSESession) Initialize() {
 	s.initialized.Store(true)
 }
 
-func (s *sseSession) Initialized() bool {
+func (s *SSESession) Initialized() bool {
 	return s.initialized.Load()
 }
 
-var _ ClientSession = (*sseSession)(nil)
+var _ ClientSession = (*SSESession)(nil)
 
 // SSEServer implements a Server-Sent Events (SSE) based MCP server.
 // It provides real-time communication capabilities over HTTP using the SSE protocol.
@@ -231,7 +231,7 @@ func (s *SSEServer) Shutdown(ctx context.Context) error {
 
 	if srv != nil {
 		s.sessions.Range(func(key, value interface{}) bool {
-			if session, ok := value.(*sseSession); ok {
+			if session, ok := value.(*SSESession); ok {
 				close(session.done)
 			}
 			s.sessions.Delete(key)
@@ -281,7 +281,7 @@ func (s *SSEServer) handleSSE(w http.ResponseWriter, r *http.Request) {
 		notificationChannel = s.notificationChannelBuilder(sessionID)
 	}
 
-	session := &sseSession{
+	session := &SSESession{
 		writer:              w,
 		flusher:             flusher,
 		done:                make(chan struct{}),
@@ -409,7 +409,6 @@ func (s *SSEServer) handleMessage(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Get session from registry
-	var err error
 	session, err := s.sessionRegistry.GetSession(r.Context(), sessionID)
 	if err != nil {
 		s.writeJSONRPCError(w, nil, mcp.INVALID_PARAMS, fmt.Sprintf("Invalid session ID: %v", err))
@@ -488,7 +487,7 @@ func (s *SSEServer) SendEventToSession(
 	if !ok {
 		return fmt.Errorf("session not found: %s", sessionID)
 	}
-	session := sessionI.(*sseSession)
+	session := sessionI.(*SSESession)
 
 	eventData, err := json.Marshal(event)
 	if err != nil {
