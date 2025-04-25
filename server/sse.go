@@ -65,6 +65,7 @@ type SSEServer struct {
 	contextFunc                  SSEContextFunc
 	eventQueueBuilder            EventQueueBuilder
 	notificationChannelBuilder   NotificationChannelBuilder
+	sessionRegistry              SessionRegistry
 
 	keepAlive         bool
 	keepAliveInterval time.Duration
@@ -242,6 +243,13 @@ func (s *SSEServer) Shutdown(ctx context.Context) error {
 	return nil
 }
 
+// SetSessionRegistry sets the session registry implementation
+func (s *SSEServer) SetSessionRegistry(registry SessionRegistry) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.sessionRegistry = registry
+}
+
 // handleSSE handles incoming SSE connection requests.
 // It sets up appropriate headers and creates a new session for the client.
 func (s *SSEServer) handleSSE(w http.ResponseWriter, r *http.Request) {
@@ -284,6 +292,16 @@ func (s *SSEServer) handleSSE(w http.ResponseWriter, r *http.Request) {
 
 	s.sessions.Store(sessionID, session)
 	defer s.sessions.Delete(sessionID)
+
+	// If using a session registry, store the session there too
+	if s.sessionRegistry != nil {
+		if err := s.sessionRegistry.StoreSession(r.Context(), session); err != nil {
+			http.Error(w, fmt.Sprintf("Failed to store session in registry: %v", err), http.StatusInternalServerError)
+			return
+		}
+		// Make sure to delete from the registry when done
+		defer s.sessionRegistry.DeleteSession(r.Context(), sessionID)
+	}
 
 	if err := s.server.RegisterSession(r.Context(), session); err != nil {
 		http.Error(w, fmt.Sprintf("Session registration failed: %v", err), http.StatusInternalServerError)
@@ -383,12 +401,20 @@ func (s *SSEServer) handleMessage(w http.ResponseWriter, r *http.Request) {
 		s.writeJSONRPCError(w, nil, mcp.INVALID_PARAMS, "Missing sessionId")
 		return
 	}
-	sessionI, ok := s.sessions.Load(sessionID)
-	if !ok {
-		s.writeJSONRPCError(w, nil, mcp.INVALID_PARAMS, "Invalid session ID")
+
+	// Check if session registry is configured
+	if s.sessionRegistry == nil {
+		s.writeJSONRPCError(w, nil, mcp.INTERNAL_ERROR, "Session registry not configured")
 		return
 	}
-	session := sessionI.(*sseSession)
+
+	// Get session from registry
+	var err error
+	session, err := s.sessionRegistry.GetSession(r.Context(), sessionID)
+	if err != nil {
+		s.writeJSONRPCError(w, nil, mcp.INVALID_PARAMS, fmt.Sprintf("Invalid session ID: %v", err))
+		return
+	}
 
 	// Set the client context before handling the message
 	ctx := s.server.WithContext(r.Context(), session)
@@ -406,18 +432,27 @@ func (s *SSEServer) handleMessage(w http.ResponseWriter, r *http.Request) {
 	// Process message through MCPServer
 	response := s.server.HandleMessage(ctx, rawMessage)
 
+	// Record that the session has been initialized
+	if !session.Initialized() {
+		session.Initialize()
+
+		// Update the initialized state in the registry
+		if err := s.sessionRegistry.UpdateInitialized(r.Context(), sessionID, true); err != nil {
+			// Log the error but continue
+			fmt.Printf("Failed to update session initialization status: %v\n", err)
+		}
+	}
+
 	// Only send response if there is one (not for notifications)
 	if response != nil {
 		eventData, _ := json.Marshal(response)
+		eventMessage := fmt.Sprintf("event: message\ndata: %s\n\n", eventData)
 
-		// Queue the event for sending via SSE
-		select {
-		case session.eventQueue <- fmt.Sprintf("event: message\ndata: %s\n\n", eventData):
-			// Event queued successfully
-		case <-session.done:
-			// Session is closed, don't try to queue
-		default:
-			// Queue is full, could log this
+		// Create a temporary event queue and send through it
+		// The event will be published to Redis and picked up by subscribers
+		if s.eventQueueBuilder != nil {
+			tmpEventQueue := s.eventQueueBuilder(sessionID)
+			tmpEventQueue <- eventMessage
 		}
 
 		// Send HTTP response
