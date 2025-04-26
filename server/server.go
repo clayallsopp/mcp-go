@@ -138,6 +138,42 @@ var (
 // NotificationHandlerFunc handles incoming notifications.
 type NotificationHandlerFunc func(ctx context.Context, notification mcp.JSONRPCNotification)
 
+// SessionStore defines the interface for managing client sessions.
+type SessionStore interface {
+	// LoadOrStore stores a session if the key is not present, otherwise returns the existing session.
+	LoadOrStore(key string, value ClientSession) (actual ClientSession, loaded bool)
+	// LoadAndDelete deletes the session for a key, returning the previous value if any.
+	LoadAndDelete(key string) (value ClientSession, loaded bool)
+}
+
+// defaultSessionStore is the default implementation of SessionStore using sync.Map.
+type defaultSessionStore struct {
+	sessions sync.Map
+}
+
+// LoadOrStore implements the SessionStore interface.
+func (d *defaultSessionStore) LoadOrStore(key string, value ClientSession) (ClientSession, bool) {
+	actual, loaded := d.sessions.LoadOrStore(key, value)
+	if actual == nil {
+		return nil, loaded // Handle nil case if LoadOrStore returns nil interface
+	}
+	return actual.(ClientSession), loaded // Type assertion needed
+}
+
+// LoadAndDelete implements the SessionStore interface.
+func (d *defaultSessionStore) LoadAndDelete(key string) (ClientSession, bool) {
+	value, loaded := d.sessions.LoadAndDelete(key)
+	if !loaded || value == nil {
+		return nil, false
+	}
+	return value.(ClientSession), true // Type assertion needed
+}
+
+// newDefaultSessionStore creates a new instance of the default session store.
+func newDefaultSessionStore() SessionStore {
+	return &defaultSessionStore{}
+}
+
 // MCPServer implements a Model Context Protocol server that can handle various types of requests
 // including resources, prompts, and tools.
 type MCPServer struct {
@@ -161,7 +197,7 @@ type MCPServer struct {
 	notificationHandlers   map[string]NotificationHandlerFunc
 	capabilities           serverCapabilities
 	paginationLimit        *int
-	sessions               sync.Map
+	sessionStore           SessionStore
 	hooks                  *Hooks
 }
 
@@ -183,6 +219,13 @@ func WithPaginationLimit(limit int) ServerOption {
 	}
 }
 
+// WithSessionStore provides a custom SessionStore implementation.
+func WithSessionStore(store SessionStore) ServerOption {
+	return func(s *MCPServer) {
+		s.sessionStore = store
+	}
+}
+
 // WithContext sets the current client session and returns the provided context
 func (s *MCPServer) WithContext(
 	ctx context.Context,
@@ -197,7 +240,7 @@ func (s *MCPServer) RegisterSession(
 	session ClientSession,
 ) error {
 	sessionID := session.SessionID()
-	if _, exists := s.sessions.LoadOrStore(sessionID, session); exists {
+	if _, exists := s.sessionStore.LoadOrStore(sessionID, session); exists {
 		return fmt.Errorf("session %s is already registered", sessionID)
 	}
 	s.hooks.RegisterSession(ctx, session)
@@ -209,8 +252,10 @@ func (s *MCPServer) UnregisterSession(
 	ctx context.Context,
 	sessionID string,
 ) {
-	session, _ := s.sessions.LoadAndDelete(sessionID)
-	s.hooks.UnregisterSession(ctx, session.(ClientSession))
+	session, loaded := s.sessionStore.LoadAndDelete(sessionID)
+	if loaded {
+		s.hooks.UnregisterSession(ctx, session)
+	}
 }
 
 // SendNotificationToClient sends a notification to the current client
@@ -366,10 +411,15 @@ func NewMCPServer(
 			prompts:   nil,
 			logging:   false,
 		},
+		sessionStore: newDefaultSessionStore(), // Initialize with default store
 	}
 
 	for _, opt := range opts {
 		opt(s)
+	}
+	// Ensure sessionStore is initialized if a custom one wasn't provided
+	if s.sessionStore == nil {
+		s.sessionStore = newDefaultSessionStore()
 	}
 
 	return s
