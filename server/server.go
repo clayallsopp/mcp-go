@@ -213,33 +213,6 @@ func (s *MCPServer) UnregisterSession(
 	s.hooks.UnregisterSession(ctx, session.(ClientSession))
 }
 
-// SendNotificationToAllClients sends a notification to all the currently active clients.
-func (s *MCPServer) SendNotificationToAllClients(
-	method string,
-	params map[string]any,
-) {
-	notification := mcp.JSONRPCNotification{
-		JSONRPC: mcp.JSONRPC_VERSION,
-		Notification: mcp.Notification{
-			Method: method,
-			Params: mcp.NotificationParams{
-				AdditionalFields: params,
-			},
-		},
-	}
-
-	s.sessions.Range(func(k, v any) bool {
-		if session, ok := v.(ClientSession); ok && session.Initialized() {
-			select {
-			case session.NotificationChannel() <- notification:
-			default:
-				// TODO: log blocked channel in the future versions
-			}
-		}
-		return true
-	})
-}
-
 // SendNotificationToClient sends a notification to the current client
 func (s *MCPServer) SendNotificationToClient(
 	ctx context.Context,
@@ -419,12 +392,6 @@ func (s *MCPServer) AddResource(
 		resource: resource,
 		handler:  handler,
 	}
-
-	// When the list of available resources changes, servers that declared the listChanged capability SHOULD send a notification
-	if s.capabilities.resources.listChanged {
-		// Send notification to all initialized sessions
-		s.SendNotificationToAllClients(mcp.MethodNotificationResourcesListChanged, nil)
-	}
 }
 
 // RemoveResource removes a resource from the server
@@ -432,11 +399,6 @@ func (s *MCPServer) RemoveResource(uri string) {
 	s.resourcesMu.Lock()
 	delete(s.resources, uri)
 	s.resourcesMu.Unlock()
-
-	// Send notification to all initialized sessions if listChanged capability is enabled
-	if s.capabilities.resources != nil && s.capabilities.resources.listChanged {
-		s.SendNotificationToAllClients("resources/list_changed", nil)
-	}
 }
 
 // AddResourceTemplate registers a new resource template and its handler
@@ -456,12 +418,6 @@ func (s *MCPServer) AddResourceTemplate(
 		template: template,
 		handler:  handler,
 	}
-
-	// When the list of available resources changes, servers that declared the listChanged capability SHOULD send a notification
-	if s.capabilities.resources.listChanged {
-		// Send notification to all initialized sessions
-		s.SendNotificationToAllClients(mcp.MethodNotificationResourcesListChanged, nil)
-	}
 }
 
 // AddPrompt registers a new prompt handler with the given name
@@ -476,12 +432,6 @@ func (s *MCPServer) AddPrompt(prompt mcp.Prompt, handler PromptHandlerFunc) {
 	defer s.promptsMu.Unlock()
 	s.prompts[prompt.Name] = prompt
 	s.promptHandlers[prompt.Name] = handler
-
-	// When the list of available resources changes, servers that declared the listChanged capability SHOULD send a notification.
-	if s.capabilities.prompts.listChanged {
-		// Send notification to all initialized sessions
-		s.SendNotificationToAllClients(mcp.MethodNotificationPromptsListChanged, nil)
-	}
 }
 
 // AddTool registers a new tool and its handler
@@ -502,12 +452,6 @@ func (s *MCPServer) AddTools(tools ...ServerTool) {
 		s.tools[entry.Tool.Name] = entry
 	}
 	s.toolsMu.Unlock()
-
-	// When the list of available tools changes, servers that declared the listChanged capability SHOULD send a notification.
-	if s.capabilities.tools.listChanged {
-		// Send notification to all initialized sessions
-		s.SendNotificationToAllClients(mcp.MethodNotificationToolsListChanged, nil)
-	}
 }
 
 // SetTools replaces all existing tools with the provided list
@@ -525,12 +469,6 @@ func (s *MCPServer) DeleteTools(names ...string) {
 		delete(s.tools, name)
 	}
 	s.toolsMu.Unlock()
-
-	// When the list of available tools changes, servers that declared the listChanged capability SHOULD send a notification.
-	if s.capabilities.tools.listChanged {
-		// Send notification to all initialized sessions
-		s.SendNotificationToAllClients(mcp.MethodNotificationToolsListChanged, nil)
-	}
 }
 
 // AddNotificationHandler registers a new handler for incoming notifications

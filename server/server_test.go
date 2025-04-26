@@ -197,9 +197,8 @@ func TestMCPServer_Tools(t *testing.T) {
 					},
 				})
 			},
-			expectedNotifications: 1,
+			expectedNotifications: 0,
 			validate: func(t *testing.T, notifications []mcp.JSONRPCNotification, toolsList mcp.JSONRPCMessage) {
-				assert.Equal(t, mcp.MethodNotificationToolsListChanged, notifications[0].Method)
 				tools := toolsList.(mcp.JSONRPCResponse).Result.(mcp.ListToolsResult).Tools
 				assert.Len(t, tools, 2)
 				assert.Equal(t, "test-tool-1", tools[0].Name)
@@ -238,7 +237,7 @@ func TestMCPServer_Tools(t *testing.T) {
 					},
 				})
 			},
-			expectedNotifications: 5,
+			expectedNotifications: 0,
 			validate: func(t *testing.T, notifications []mcp.JSONRPCNotification, toolsList mcp.JSONRPCMessage) {
 				for _, notification := range notifications {
 					assert.Equal(t, mcp.MethodNotificationToolsListChanged, notification.Method)
@@ -267,10 +266,8 @@ func TestMCPServer_Tools(t *testing.T) {
 						return &mcp.CallToolResult{}, nil
 					})
 			},
-			expectedNotifications: 2,
+			expectedNotifications: 0,
 			validate: func(t *testing.T, notifications []mcp.JSONRPCNotification, toolsList mcp.JSONRPCMessage) {
-				assert.Equal(t, mcp.MethodNotificationToolsListChanged, notifications[0].Method)
-				assert.Equal(t, mcp.MethodNotificationToolsListChanged, notifications[1].Method)
 				tools := toolsList.(mcp.JSONRPCResponse).Result.(mcp.ListToolsResult).Tools
 				assert.Len(t, tools, 2)
 				assert.Equal(t, "test-tool-1", tools[0].Name)
@@ -291,12 +288,8 @@ func TestMCPServer_Tools(t *testing.T) {
 					ServerTool{Tool: mcp.NewTool("test-tool-2")})
 				server.DeleteTools("test-tool-1", "test-tool-2")
 			},
-			expectedNotifications: 2,
+			expectedNotifications: 0,
 			validate: func(t *testing.T, notifications []mcp.JSONRPCNotification, toolsList mcp.JSONRPCMessage) {
-				// One for SetTools
-				assert.Equal(t, mcp.MethodNotificationToolsListChanged, notifications[0].Method)
-				// One for DeleteTools
-				assert.Equal(t, mcp.MethodNotificationToolsListChanged, notifications[1].Method)
 
 				// Expect a successful response with an empty list of tools
 				resp, ok := toolsList.(mcp.JSONRPCResponse)
@@ -570,75 +563,6 @@ func TestMCPServer_SendNotificationToClient(t *testing.T) {
 			tt.validate(t, ctx, server)
 		})
 	}
-}
-
-func TestMCPServer_SendNotificationToAllClients(t *testing.T) {
-
-	contextPrepare := func(ctx context.Context, srv *MCPServer) context.Context {
-		// Create 5 active sessions
-		for i := 0; i < 5; i++ {
-			err := srv.RegisterSession(ctx, &fakeSession{
-				sessionID:           fmt.Sprintf("test%d", i),
-				notificationChannel: make(chan mcp.JSONRPCNotification, 10),
-				initialized:         true,
-			})
-			require.NoError(t, err)
-		}
-		return ctx
-	}
-
-	validate := func(t *testing.T, ctx context.Context, srv *MCPServer) {
-		// Send 10 notifications to all sessions
-		for i := 0; i < 10; i++ {
-			srv.SendNotificationToAllClients("method", map[string]any{
-				"count": i,
-			})
-		}
-
-		// Verify each session received all 10 notifications
-		srv.sessions.Range(func(k, v any) bool {
-			session := v.(ClientSession)
-			fakeSess := session.(*fakeSession)
-			notificationCount := 0
-
-			// Read all notifications from the channel
-			for notificationCount < 10 {
-				select {
-				case notification := <-fakeSess.notificationChannel:
-					// Verify notification method
-					assert.Equal(t, "method", notification.Method)
-					// Verify count parameter
-					count, ok := notification.Params.AdditionalFields["count"]
-					assert.True(t, ok, "count parameter not found")
-					assert.Equal(t, notificationCount, count.(int), "count should match notification count")
-					notificationCount++
-				case <-time.After(100 * time.Millisecond):
-					t.Errorf("timeout waiting for notification %d for session %s", notificationCount, session.SessionID())
-					return false
-				}
-			}
-
-			// Verify no more notifications
-			select {
-			case notification := <-fakeSess.notificationChannel:
-				t.Errorf("unexpected notification received: %v", notification)
-			default:
-				// Channel empty as expected
-			}
-			return true
-		})
-	}
-
-	t.Run("all sessions", func(t *testing.T) {
-		server := NewMCPServer("test-server", "1.0.0")
-		ctx := contextPrepare(context.Background(), server)
-		_ = server.HandleMessage(ctx, []byte(`{
-				"jsonrpc": "2.0",
-				"id": 1,
-				"method": "initialize"
-			}`))
-		validate(t, ctx, server)
-	})
 }
 
 func TestMCPServer_PromptHandling(t *testing.T) {
