@@ -305,7 +305,7 @@ func TestMCPServer_Tools(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			ctx := context.Background()
-			server := NewMCPServer("test-server", "1.0.0", WithToolCapabilities(true))
+			server := NewMCPServer("test-server", "1.0.0", WithToolCapabilities(true), WithSessionStore(NewDefaultSessionStore()))
 			_ = server.HandleMessage(ctx, []byte(`{
 				"jsonrpc": "2.0",
 				"id": 1,
@@ -480,7 +480,7 @@ func TestMCPServer_HandleNotifications(t *testing.T) {
 	assert.True(t, notificationReceived)
 }
 
-func TestMCPServer_SendNotificationToClient(t *testing.T) {
+func TestMCPServer_SendNotificationToSession(t *testing.T) {
 	tests := []struct {
 		name           string
 		contextPrepare func(context.Context, *MCPServer) context.Context
@@ -492,38 +492,42 @@ func TestMCPServer_SendNotificationToClient(t *testing.T) {
 				return ctx
 			},
 			validate: func(t *testing.T, ctx context.Context, srv *MCPServer) {
-				require.Error(t, srv.SendNotificationToClient(ctx, "method", nil))
+				require.Error(t, srv.SendNotificationToSession(ctx, "test", "method", nil))
 			},
 		},
 		{
 			name: "uninit session",
 			contextPrepare: func(ctx context.Context, srv *MCPServer) context.Context {
-				return srv.WithContext(ctx, fakeSession{
+				session := &fakeSession{
 					sessionID:           "test",
 					notificationChannel: make(chan mcp.JSONRPCNotification, 10),
 					initialized:         false,
-				})
+				}
+				srv.RegisterSession(ctx, session)
+				return srv.WithContext(ctx, session)
 			},
 			validate: func(t *testing.T, ctx context.Context, srv *MCPServer) {
-				require.Error(t, srv.SendNotificationToClient(ctx, "method", nil))
-				_, ok := ClientSessionFromContext(ctx).(fakeSession)
+				require.Error(t, srv.SendNotificationToSession(ctx, "test", "method", nil))
+				_, ok := ClientSessionFromContext(ctx).(*fakeSession)
 				require.True(t, ok, "session not found or of incorrect type")
 			},
 		},
 		{
 			name: "active session",
 			contextPrepare: func(ctx context.Context, srv *MCPServer) context.Context {
-				return srv.WithContext(ctx, fakeSession{
+				session := &fakeSession{
 					sessionID:           "test",
 					notificationChannel: make(chan mcp.JSONRPCNotification, 10),
 					initialized:         true,
-				})
+				}
+				srv.RegisterSession(ctx, session)
+				return srv.WithContext(ctx, session)
 			},
 			validate: func(t *testing.T, ctx context.Context, srv *MCPServer) {
 				for range 10 {
-					require.NoError(t, srv.SendNotificationToClient(ctx, "method", nil))
+					require.NoError(t, srv.SendNotificationToSession(ctx, "test", "method", nil))
 				}
-				session, ok := ClientSessionFromContext(ctx).(fakeSession)
+				session, ok := ClientSessionFromContext(ctx).(*fakeSession)
 				require.True(t, ok, "session not found or of incorrect type")
 				for range 10 {
 					select {
@@ -538,21 +542,24 @@ func TestMCPServer_SendNotificationToClient(t *testing.T) {
 		{
 			name: "session with blocked channel",
 			contextPrepare: func(ctx context.Context, srv *MCPServer) context.Context {
-				return srv.WithContext(ctx, fakeSession{
+				session := &fakeSession{
 					sessionID:           "test",
 					notificationChannel: make(chan mcp.JSONRPCNotification, 1),
 					initialized:         true,
-				})
+				}
+				srv.RegisterSession(ctx, session)
+				return srv.WithContext(ctx, session)
 			},
 			validate: func(t *testing.T, ctx context.Context, srv *MCPServer) {
-				require.NoError(t, srv.SendNotificationToClient(ctx, "method", nil))
-				require.Error(t, srv.SendNotificationToClient(ctx, "method", nil))
+				require.NoError(t, srv.SendNotificationToSession(ctx, "test", "method", nil))
+				require.Error(t, srv.SendNotificationToSession(ctx, "test", "method", nil))
 			},
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			server := NewMCPServer("test-server", "1.0.0")
+			server := NewMCPServer("test-server", "1.0.0",
+				WithSessionStore(NewDefaultSessionStore()))
 			ctx := tt.contextPrepare(context.Background(), server)
 			_ = server.HandleMessage(ctx, []byte(`{
 				"jsonrpc": "2.0",
@@ -1184,6 +1191,21 @@ func (f fakeSession) Initialized() bool {
 	return f.initialized
 }
 
+func (f fakeSession) PublishNotification(ctx context.Context, notification mcp.JSONRPCNotification) error {
+	select {
+	case f.notificationChannel <- notification:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+		return fmt.Errorf("notification channel full for session %s", f.sessionID)
+	}
+}
+
+func (f fakeSession) SubscribeNotifications(ctx context.Context) <-chan mcp.JSONRPCNotification {
+	return f.notificationChannel
+}
+
 var _ ClientSession = fakeSession{}
 
 func TestMCPServer_WithHooks(t *testing.T) {
@@ -1372,6 +1394,7 @@ func TestMCPServer_SessionHooks(t *testing.T) {
 		"test-server",
 		"1.0.0",
 		WithHooks(hooks),
+		WithSessionStore(NewDefaultSessionStore()),
 	)
 
 	testSession := &fakeSession{
@@ -1399,7 +1422,7 @@ func TestMCPServer_SessionHooks(t *testing.T) {
 }
 
 func TestMCPServer_SessionHooks_NilHooks(t *testing.T) {
-	server := NewMCPServer("test-server", "1.0.0")
+	server := NewMCPServer("test-server", "1.0.0", WithSessionStore(NewDefaultSessionStore()))
 
 	testSession := &fakeSession{
 		sessionID:           "test-session-id",
@@ -1423,6 +1446,7 @@ func TestMCPServer_WithRecover(t *testing.T) {
 		"test-server",
 		"1.0.0",
 		WithRecovery(),
+		WithSessionStore(NewDefaultSessionStore()),
 	)
 
 	server.AddTool(
