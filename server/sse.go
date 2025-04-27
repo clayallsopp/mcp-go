@@ -12,8 +12,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/clayallsopp/mcp-go/mcp"
 	"github.com/google/uuid"
-	"github.com/mark3labs/mcp-go/mcp"
 )
 
 // sseConnection represents an active SSE connection linked to a clientSession.
