@@ -59,7 +59,7 @@ func (s *stdioSession) SessionID() string {
 	return "stdio"
 }
 
-func (s *stdioSession) NotificationChannel() chan<- mcp.JSONRPCNotification {
+func (s *stdioSession) NotificationChannel() chan mcp.JSONRPCNotification {
 	return s.notifications
 }
 

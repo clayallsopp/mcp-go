@@ -20,10 +20,12 @@ import (
 
 func TestSSEServer(t *testing.T) {
 	t.Run("Can instantiate", func(t *testing.T) {
-		mcpServer := NewMCPServer("test", "1.0.0")
+		sessionStore := NewDefaultSSESessionStore()
+		mcpServer := NewMCPServer("test", "1.0.0", WithSessionStore(sessionStore))
 		sseServer := NewSSEServer(mcpServer,
 			WithBaseURL("http://localhost:8080"),
 			WithBasePath("/mcp"),
+			WithSSESessionStore(sessionStore),
 		)
 
 		if sseServer == nil {
@@ -47,10 +49,14 @@ func TestSSEServer(t *testing.T) {
 	})
 
 	t.Run("Can send and receive messages", func(t *testing.T) {
+		sessionStore := NewDefaultSSESessionStore()
 		mcpServer := NewMCPServer("test", "1.0.0",
 			WithResourceCapabilities(true, true),
+			WithSessionStore(sessionStore),
 		)
-		testServer := NewTestServer(mcpServer)
+		testServer := NewTestServer(mcpServer,
+			WithSSESessionStore(sessionStore),
+		)
 		defer testServer.Close()
 
 		// Connect to SSE endpoint
@@ -125,10 +131,14 @@ func TestSSEServer(t *testing.T) {
 	})
 
 	t.Run("Can handle multiple sessions", func(t *testing.T) {
+		sessionStore := NewDefaultSSESessionStore()
 		mcpServer := NewMCPServer("test", "1.0.0",
 			WithResourceCapabilities(true, true),
+			WithSessionStore(sessionStore),
 		)
-		testServer := NewTestServer(mcpServer)
+		testServer := NewTestServer(mcpServer,
+			WithSSESessionStore(sessionStore),
+		)
 		defer testServer.Close()
 
 		numSessions := 3
@@ -247,8 +257,14 @@ func TestSSEServer(t *testing.T) {
 	})
 
 	t.Run("Can be used as http.Handler", func(t *testing.T) {
-		mcpServer := NewMCPServer("test", "1.0.0")
-		sseServer := NewSSEServer(mcpServer, WithBaseURL("http://localhost:8080"))
+		sessionStore := NewDefaultSSESessionStore()
+		mcpServer := NewMCPServer("test", "1.0.0",
+			WithSessionStore(sessionStore),
+		)
+		sseServer := NewSSEServer(mcpServer,
+			WithBaseURL("http://localhost:8080"),
+			WithSSESessionStore(sessionStore),
+		)
 
 		ts := httptest.NewServer(sseServer)
 		defer ts.Close()
@@ -300,8 +316,14 @@ func TestSSEServer(t *testing.T) {
 	})
 
 	t.Run("Works with middleware", func(t *testing.T) {
-		mcpServer := NewMCPServer("test", "1.0.0")
-		sseServer := NewSSEServer(mcpServer, WithBaseURL("http://localhost:8080"))
+		sessionStore := NewDefaultSSESessionStore()
+		mcpServer := NewMCPServer("test", "1.0.0",
+			WithSessionStore(sessionStore),
+		)
+		sseServer := NewSSEServer(mcpServer,
+			WithBaseURL("http://localhost:8080"),
+			WithSSESessionStore(sessionStore),
+		)
 
 		middleware := func(next http.Handler) http.Handler {
 			return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -349,8 +371,13 @@ func TestSSEServer(t *testing.T) {
 	})
 
 	t.Run("Works with custom mux", func(t *testing.T) {
-		mcpServer := NewMCPServer("test", "1.0.0")
-		sseServer := NewSSEServer(mcpServer)
+		sessionStore := NewDefaultSSESessionStore()
+		mcpServer := NewMCPServer("test", "1.0.0",
+			WithSessionStore(sessionStore),
+		)
+		sseServer := NewSSEServer(mcpServer,
+			WithSSESessionStore(sessionStore),
+		)
 
 		mux := http.NewServeMux()
 		mux.Handle("/mcp/", sseServer)
@@ -421,8 +448,13 @@ func TestSSEServer(t *testing.T) {
 	})
 
 	t.Run("test useFullURLForMessageEndpoint", func(t *testing.T) {
-		mcpServer := NewMCPServer("test", "1.0.0")
-		sseServer := NewSSEServer(mcpServer)
+		sessionStore := NewDefaultSSESessionStore()
+		mcpServer := NewMCPServer("test", "1.0.0",
+			WithSessionStore(sessionStore),
+		)
+		sseServer := NewSSEServer(mcpServer,
+			WithSSESessionStore(sessionStore),
+		)
 
 		mux := http.NewServeMux()
 		mux.Handle("/mcp/", sseServer)
@@ -496,8 +528,14 @@ func TestSSEServer(t *testing.T) {
 	})
 
 	t.Run("works as http.Handler with custom basePath", func(t *testing.T) {
-		mcpServer := NewMCPServer("test", "1.0.0")
-		sseServer := NewSSEServer(mcpServer, WithBasePath("/mcp"))
+		sessionStore := NewDefaultSSESessionStore()
+		mcpServer := NewMCPServer("test", "1.0.0",
+			WithSessionStore(sessionStore),
+		)
+		sseServer := NewSSEServer(mcpServer,
+			WithBasePath("/mcp"),
+			WithSSESessionStore(sessionStore),
+		)
 
 		ts := httptest.NewServer(sseServer)
 		defer ts.Close()
@@ -567,8 +605,10 @@ func TestSSEServer(t *testing.T) {
 			return context.WithValue(ctx, testContextKey{}, r.Header.Get(testHeader))
 		}
 
+		sessionStore := NewDefaultSSESessionStore()
 		mcpServer := NewMCPServer("test", "1.0.0",
 			WithResourceCapabilities(true, true),
+			WithSessionStore(sessionStore),
 		)
 		// Add a tool which uses the context function.
 		mcpServer.AddTool(mcp.NewTool("test_tool"), func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -577,7 +617,10 @@ func TestSSEServer(t *testing.T) {
 			return mcp.NewToolResultText(testVal), nil
 		})
 
-		testServer := NewTestServer(mcpServer, WithSSEContextFunc(setTestValFromRequest))
+		testServer := NewTestServer(mcpServer,
+			WithSSEContextFunc(setTestValFromRequest),
+			WithSSESessionStore(sessionStore),
+		)
 		defer testServer.Close()
 
 		// Connect to SSE endpoint
@@ -693,7 +736,10 @@ func TestSSEServer(t *testing.T) {
 	})
 
 	t.Run("SSEOption should not have negative effects when used repeatedly but should always remain consistent.", func(t *testing.T) {
-		mcpServer := NewMCPServer("test", "1.0.0")
+		sessionStore := NewDefaultSSESessionStore()
+		mcpServer := NewMCPServer("test", "1.0.0",
+			WithSessionStore(sessionStore),
+		)
 		basePath := "/mcp-test"
 		baseURL := "http://localhost:8080/test"
 		messageEndpoint := "/message-test"
@@ -706,6 +752,7 @@ func TestSSEServer(t *testing.T) {
 			WithMessageEndpoint(messageEndpoint),
 			WithUseFullURLForMessageEndpoint(useFullURLForMessageEndpoint),
 			WithSSEEndpoint(sseEndpoint),
+			WithSSESessionStore(sessionStore),
 			WithHTTPServer(srv),
 		}
 		for i := 0; i < 100; i++ {
@@ -743,10 +790,14 @@ func TestSSEServer(t *testing.T) {
 	})
 
 	t.Run("Client receives and can respond to ping messages", func(t *testing.T) {
-		mcpServer := NewMCPServer("test", "1.0.0")
+		sessionStore := NewDefaultSSESessionStore()
+		mcpServer := NewMCPServer("test", "1.0.0",
+			WithSessionStore(sessionStore),
+		)
 		testServer := NewTestServer(mcpServer,
 			WithKeepAlive(true),
 			WithKeepAliveInterval(50*time.Millisecond),
+			WithSSESessionStore(sessionStore),
 		)
 		defer testServer.Close()
 

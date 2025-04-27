@@ -57,7 +57,7 @@ type ClientSession interface {
 	// Initialized returns if session is ready to accept notifications
 	Initialized() bool
 	// NotificationChannel provides a channel suitable for sending notifications to client.
-	NotificationChannel() chan<- mcp.JSONRPCNotification
+	NotificationChannel() chan mcp.JSONRPCNotification
 	// SessionID is a unique identifier used to track user session.
 	SessionID() string
 }
@@ -147,12 +147,12 @@ type SessionStore interface {
 }
 
 // defaultSessionStore is the default implementation of SessionStore using sync.Map.
-type defaultSessionStore struct {
+type DefaultSessionStore struct {
 	sessions sync.Map
 }
 
 // LoadOrStore implements the SessionStore interface.
-func (d *defaultSessionStore) LoadOrStore(key string, value ClientSession) (ClientSession, bool) {
+func (d *DefaultSessionStore) LoadOrStore(key string, value ClientSession) (ClientSession, bool) {
 	actual, loaded := d.sessions.LoadOrStore(key, value)
 	if actual == nil {
 		return nil, loaded // Handle nil case if LoadOrStore returns nil interface
@@ -161,7 +161,7 @@ func (d *defaultSessionStore) LoadOrStore(key string, value ClientSession) (Clie
 }
 
 // LoadAndDelete implements the SessionStore interface.
-func (d *defaultSessionStore) LoadAndDelete(key string) (ClientSession, bool) {
+func (d *DefaultSessionStore) LoadAndDelete(key string) (ClientSession, bool) {
 	value, loaded := d.sessions.LoadAndDelete(key)
 	if !loaded || value == nil {
 		return nil, false
@@ -170,8 +170,10 @@ func (d *defaultSessionStore) LoadAndDelete(key string) (ClientSession, bool) {
 }
 
 // newDefaultSessionStore creates a new instance of the default session store.
-func newDefaultSessionStore() SessionStore {
-	return &defaultSessionStore{}
+func NewDefaultSessionStore() *DefaultSessionStore {
+	return &DefaultSessionStore{
+		sessions: sync.Map{},
+	}
 }
 
 // MCPServer implements a Model Context Protocol server that can handle various types of requests
@@ -411,15 +413,10 @@ func NewMCPServer(
 			prompts:   nil,
 			logging:   false,
 		},
-		sessionStore: newDefaultSessionStore(), // Initialize with default store
 	}
 
 	for _, opt := range opts {
 		opt(s)
-	}
-	// Ensure sessionStore is initialized if a custom one wasn't provided
-	if s.sessionStore == nil {
-		s.sessionStore = newDefaultSessionStore()
 	}
 
 	return s

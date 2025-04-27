@@ -18,12 +18,11 @@ import (
 
 // sseConnection represents an active SSE connection linked to a clientSession.
 type sseConnection struct {
-	writer     http.ResponseWriter
-	flusher    http.Flusher
-	done       chan struct{}
-	eventQueue chan string // Channel for queuing events specific to this connection
-	requestID  atomic.Int64
-	session    *clientSession // Reference back to the logical session
+	writer    http.ResponseWriter
+	flusher   http.Flusher
+	done      chan struct{}
+	requestID atomic.Int64
+	session   *SSESession // Reference back to the logical session
 }
 
 // close closes the connection's done channel.
@@ -37,72 +36,11 @@ func (c *sseConnection) close() {
 	}
 }
 
-// queueEvent tries to queue an event for this connection.
-// Returns false if the queue is full or the connection is closed.
-func (c *sseConnection) queueEvent(event string) bool {
-	select {
-	case c.eventQueue <- event:
-		return true
-	case <-c.done:
-		return false // Connection closed
-	default:
-		// Consider adding a timeout or logging if queue is full for extended periods
-		return false // Queue full
-	}
-}
+type SSESession interface {
+	ClientSession
 
-// clientSession represents a logical client session.
-type clientSession struct {
-	sessionID           string
-	notificationChannel chan mcp.JSONRPCNotification
-	initialized         atomic.Bool
-	// Store the active connection associated with this session.
-	// A session might potentially have multiple connections in the future,
-	// but for now, we assume one active connection.
-	mu               sync.RWMutex // Protects activeConnection
-	activeConnection *sseConnection
+	EventQueue() chan string
 }
-
-func (cs *clientSession) SessionID() string {
-	return cs.sessionID
-}
-
-func (cs *clientSession) NotificationChannel() chan<- mcp.JSONRPCNotification {
-	return cs.notificationChannel
-}
-
-func (cs *clientSession) Initialize() {
-	cs.initialized.Store(true)
-}
-
-func (cs *clientSession) Initialized() bool {
-	return cs.initialized.Load()
-}
-
-// setActiveConnection safely sets the active connection.
-func (cs *clientSession) setActiveConnection(conn *sseConnection) {
-	cs.mu.Lock()
-	defer cs.mu.Unlock()
-	cs.activeConnection = conn
-}
-
-// getActiveConnection safely gets the active connection.
-func (cs *clientSession) getActiveConnection() *sseConnection {
-	cs.mu.RLock()
-	defer cs.mu.RUnlock()
-	return cs.activeConnection
-}
-
-// clearActiveConnection safely clears the active connection, returning the old one.
-func (cs *clientSession) clearActiveConnection() *sseConnection {
-	cs.mu.Lock()
-	defer cs.mu.Unlock()
-	oldConn := cs.activeConnection
-	cs.activeConnection = nil
-	return oldConn
-}
-
-var _ ClientSession = (*clientSession)(nil)
 
 // SSEContextFunc is a function that takes an existing context and the current
 // request and returns a potentially modified context based on the request
@@ -118,12 +56,14 @@ type SSEServer struct {
 	useFullURLForMessageEndpoint bool
 	messageEndpoint              string
 	sseEndpoint                  string
-	sessions                     sync.Map // Stores *clientSession, keyed by sessionID
+	connections                  sync.Map // Stores *sseConnection, keyed by sessionID
 	srv                          *http.Server
 	contextFunc                  SSEContextFunc
 
 	keepAlive         bool
 	keepAliveInterval time.Duration
+
+	sessionStore SSESessionStore
 
 	mu sync.RWMutex
 }
@@ -216,6 +156,91 @@ func WithSSEContextFunc(fn SSEContextFunc) SSEOption {
 	}
 }
 
+type SSESessionStore interface {
+	SessionStore
+	CreateSession(sessionID string) SSESession
+	Load(sessionID string) (SSESession, bool)
+}
+
+// defaultSession represents a logical client session.
+type defaultSession struct {
+	sessionID           string
+	notificationChannel chan mcp.JSONRPCNotification
+	eventQueue          chan string // Channel for queuing events specific to this connection
+	initialized         atomic.Bool
+}
+
+func (cs *defaultSession) SessionID() string {
+	return cs.sessionID
+}
+
+func (cs *defaultSession) NotificationChannel() chan mcp.JSONRPCNotification {
+	return cs.notificationChannel
+}
+
+func (cs *defaultSession) EventQueue() chan string {
+	return cs.eventQueue
+}
+
+func (cs *defaultSession) Initialize() {
+	cs.initialized.Store(true)
+}
+
+func (cs *defaultSession) Initialized() bool {
+	return cs.initialized.Load()
+}
+
+type defaultSseSessionStore struct {
+	sessions sync.Map
+}
+
+func NewDefaultSSESessionStore() *defaultSseSessionStore {
+	return &defaultSseSessionStore{
+		sessions: sync.Map{},
+	}
+}
+
+func (d *defaultSseSessionStore) CreateSession(sessionID string) SSESession {
+	return &defaultSession{
+		sessionID:           sessionID,
+		notificationChannel: make(chan mcp.JSONRPCNotification, 100),
+		eventQueue:          make(chan string, 100),
+		initialized:         atomic.Bool{},
+	}
+}
+
+func (d *defaultSseSessionStore) Load(sessionID string) (SSESession, bool) {
+	sessionI, ok := d.sessions.Load(sessionID)
+	if !ok {
+		return nil, false
+	}
+	session := sessionI.(*defaultSession)
+	return session, true
+}
+
+func (d *defaultSseSessionStore) LoadAndDelete(sessionID string) (ClientSession, bool) {
+	sessionI, loaded := d.sessions.LoadAndDelete(sessionID)
+	if !loaded {
+		return nil, false
+	}
+	session := sessionI.(*defaultSession)
+	return session, true
+}
+
+func (d *defaultSseSessionStore) LoadOrStore(sessionID string, session ClientSession) (ClientSession, bool) {
+	sessionI, loaded := d.sessions.LoadOrStore(sessionID, session)
+	if !loaded {
+		return nil, false
+	}
+	return sessionI.(ClientSession), true
+}
+
+func WithSSESessionStore(store SSESessionStore) SSEOption {
+	return func(s *SSEServer) {
+		s.sessionStore = store
+	}
+}
+
 // NewSSEServer creates a new SSE server instance with the given MCP server and options.
 func NewSSEServer(server *MCPServer, opts ...SSEOption) *SSEServer {
 	s := &SSEServer{
@@ -266,17 +291,13 @@ func (s *SSEServer) Shutdown(ctx context.Context) error {
 
 	if srv != nil {
 		// Iterate over sessions and signal associated connections to close
-		s.sessions.Range(func(key, value interface{}) bool {
+		s.connections.Range(func(key, value interface{}) bool {
 			sessionID := key.(string)
-			if session, ok := value.(*clientSession); ok {
-				// Safely get and clear the active connection
-				if connection := session.clearActiveConnection(); connection != nil {
-					// Signal the connection handler to stop
-					connection.close()
-				}
+			if connection, ok := value.(*sseConnection); ok {
+				connection.close()
 			}
 			// Delete the session from the map during shutdown iteration
-			s.sessions.Delete(sessionID)
+			s.connections.Delete(sessionID)
 			// Note: UnregisterSession is implicitly handled as connections close
 			// and trigger the defer in handleSSE, or the MCPServer might handle
 			// cleanup based on context cancellation during its own shutdown.
@@ -311,27 +332,19 @@ func (s *SSEServer) handleSSE(w http.ResponseWriter, r *http.Request) {
 	sessionID := uuid.New().String()
 
 	// Create the logical session
-	session := &clientSession{
-		sessionID:           sessionID,
-		notificationChannel: make(chan mcp.JSONRPCNotification, 100),
-		// initialized is false initially
-	}
+	session := s.sessionStore.CreateSession(sessionID)
 
 	// Create the connection associated with this request
 	connection := &sseConnection{
-		writer:     w,
-		flusher:    flusher,
-		done:       make(chan struct{}),
-		eventQueue: make(chan string, 100), // Buffer for events for this connection
-		session:    session,
+		writer:  w,
+		flusher: flusher,
+		done:    make(chan struct{}),
+		session: &session,
 		// requestID starts at 0
 	}
 
-	// Link session and connection
-	session.setActiveConnection(connection)
-
 	// Store the logical session *before* registering it
-	s.sessions.Store(sessionID, session)
+	s.connections.Store(sessionID, connection)
 
 	// Defer cleanup for this connection handler
 	defer func() {
@@ -339,8 +352,7 @@ func (s *SSEServer) handleSSE(w http.ResponseWriter, r *http.Request) {
 		// clear the active connection reference in the session,
 		// remove the session from the map, and unregister from MCPServer.
 		connection.close()
-		session.clearActiveConnection()
-		s.sessions.Delete(sessionID)
+		s.connections.Delete(sessionID)
 		// Use context.Background() for unregistration if request context might be done.
 		s.server.UnregisterSession(context.Background(), sessionID)
 	}()
@@ -350,7 +362,7 @@ func (s *SSEServer) handleSSE(w http.ResponseWriter, r *http.Request) {
 	if err := s.server.RegisterSession(r.Context(), session); err != nil {
 		http.Error(w, fmt.Sprintf("Session registration failed: %v", err), http.StatusInternalServerError)
 		// If registration fails after storing, remove from map before returning.
-		s.sessions.Delete(sessionID)
+		s.connections.Delete(sessionID)
 		// We don't run the deferred cleanup in this error path.
 		return
 	}
@@ -363,21 +375,17 @@ func (s *SSEServer) handleSSE(w http.ResponseWriter, r *http.Request) {
 
 		for {
 			select {
-			case notification, ok := <-session.notificationChannel:
+			case notification, ok := <-session.NotificationChannel():
 				if !ok {
 					// Should not happen with current setup, but good practice
-					return
-				}
-				// Get the currently active connection for this session
-				activeConn := session.getActiveConnection()
-				if activeConn == nil || activeConn != connection {
-					// Connection associated with this goroutine is no longer active
 					return
 				}
 				eventData, err := json.Marshal(notification)
 				if err == nil {
 					// Queue event for the specific connection
-					if !activeConn.queueEvent(fmt.Sprintf("event: message\ndata: %s\n\n", eventData)) {
+					select {
+					case session.EventQueue() <- fmt.Sprintf("event: message\ndata: %s\n\n", eventData):
+					default:
 						// Log or handle queue failure (e.g., queue full, connection closing)
 					}
 				} else {
@@ -403,21 +411,18 @@ func (s *SSEServer) handleSSE(w http.ResponseWriter, r *http.Request) {
 				select {
 				case <-ticker.C:
 					// Get the currently active connection for this session
-					activeConn := session.getActiveConnection()
-					if activeConn == nil || activeConn != connection {
-						// Connection associated with this goroutine is no longer active
-						return // Connection is gone or replaced
-					}
 					message := mcp.JSONRPCRequest{
 						JSONRPC: "2.0",
-						ID:      activeConn.requestID.Add(1), // Use connection's requestID
+						ID:      connection.requestID.Add(1), // Use connection's requestID
 						Request: mcp.Request{
 							Method: "ping",
 						},
 					}
 					messageBytes, _ := json.Marshal(message) // Error handling omitted for ping
 					pingMsg := fmt.Sprintf("event: message\ndata:%s\n\n", messageBytes)
-					if !activeConn.queueEvent(pingMsg) {
+					select {
+					case session.EventQueue() <- pingMsg:
+					default:
 						// Log or handle failure (e.g., connection closing)
 						return // Stop trying if queue fails
 					}
@@ -439,7 +444,7 @@ func (s *SSEServer) handleSSE(w http.ResponseWriter, r *http.Request) {
 	reqCtxDone := r.Context().Done() // Cache request context's done channel
 	for {
 		select {
-		case event, ok := <-connection.eventQueue:
+		case event, ok := <-session.EventQueue():
 			if !ok {
 				// eventQueue closed, likely means connection is closing
 				return
@@ -483,14 +488,14 @@ func (s *SSEServer) handleMessage(w http.ResponseWriter, r *http.Request) {
 		s.writeJSONRPCError(w, nil, mcp.INVALID_PARAMS, "Missing sessionId")
 		return
 	}
-	sessionI, ok := s.sessions.Load(sessionID)
+
+	session, ok := s.sessionStore.Load(sessionID)
 	if !ok {
 		// It's possible the session timed out or disconnected between getting the
 		// endpoint and sending the message.
 		s.writeJSONRPCError(w, nil, mcp.INVALID_PARAMS, "Invalid or expired session ID")
 		return
 	}
-	session := sessionI.(*clientSession) // Now retrieving *clientSession
 
 	// Set the client context using the logical session before handling the message
 	// Use the request's context as the base.
@@ -512,22 +517,16 @@ func (s *SSEServer) handleMessage(w http.ResponseWriter, r *http.Request) {
 	// Only send response if there is one (not for notifications)
 	if response != nil {
 		// Get the active connection associated with the session *at this moment*.
-		connection := session.getActiveConnection()
-
-		// Try to send the response via the active SSE connection's queue
-		if connection != nil {
-			eventData, err := json.Marshal(response)
-			// Handle potential marshalling error
-			if err != nil {
-				// Log marshalling error - This response won't be sent via SSE
-			} else {
-				queued := connection.queueEvent(fmt.Sprintf("event: message\ndata: %s\n\n", eventData))
-				if !queued {
-					// Log error: Failed to queue SSE response (queue full or connection closed)
-				}
-			}
+		eventData, err := json.Marshal(response)
+		// Handle potential marshalling error
+		if err != nil {
+			// Log marshalling error - This response won't be sent via SSE
 		} else {
-			// Log info/warn: No active SSE connection found for session to send response
+			select {
+			case session.EventQueue() <- fmt.Sprintf("event: message\ndata: %s\n\n", eventData):
+			default:
+				// Log error: Failed to queue SSE response (queue full or connection closed)
+			}
 		}
 
 		// Send HTTP response (this is the POST response, separate from SSE)
@@ -570,15 +569,9 @@ func (s *SSEServer) SendEventToSession(
 	sessionID string,
 	event interface{},
 ) error {
-	sessionI, ok := s.sessions.Load(sessionID)
+	session, ok := s.sessionStore.Load(sessionID)
 	if !ok {
 		return fmt.Errorf("session not found: %s", sessionID)
-	}
-	session := sessionI.(*clientSession) // Now retrieving *clientSession
-
-	connection := session.getActiveConnection()
-	if connection == nil {
-		return fmt.Errorf("no active connection found for session: %s", sessionID)
 	}
 
 	eventData, err := json.Marshal(event)
@@ -587,14 +580,10 @@ func (s *SSEServer) SendEventToSession(
 	}
 
 	// Queue the event for sending via the specific SSE connection
-	if !connection.queueEvent(fmt.Sprintf("event: message\ndata: %s\n\n", eventData)) {
-		// Check if the connection was closed or queue was full
-		select {
-		case <-connection.done:
-			return fmt.Errorf("session connection closed for session %s", sessionID)
-		default:
-			return fmt.Errorf("event queue full for connection associated with session %s", sessionID)
-		}
+	select {
+	case session.EventQueue() <- fmt.Sprintf("event: message\ndata: %s\n\n", eventData):
+	default:
+		return fmt.Errorf("event queue full for connection associated with session %s", sessionID)
 	}
 	return nil
 }

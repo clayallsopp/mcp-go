@@ -1173,7 +1173,7 @@ func (f fakeSession) SessionID() string {
 	return f.sessionID
 }
 
-func (f fakeSession) NotificationChannel() chan<- mcp.JSONRPCNotification {
+func (f fakeSession) NotificationChannel() chan mcp.JSONRPCNotification {
 	return f.notificationChannel
 }
 
