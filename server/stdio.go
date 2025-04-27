@@ -71,6 +71,29 @@ func (s *stdioSession) Initialized() bool {
 	return s.initialized.Load()
 }
 
+func (s *stdioSession) PublishNotification(ctx context.Context, notification mcp.JSONRPCNotification) error {
+	// For stdio, publish means sending to the internal channel that handleNotifications reads.
+	select {
+	case s.notifications <- notification:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+		// Non-blocking attempt
+		return fmt.Errorf("stdio notification channel full")
+	}
+}
+
+func (s *stdioSession) SubscribeNotifications(ctx context.Context) <-chan mcp.JSONRPCNotification {
+	// For stdio, the subscriber *is* the single handleNotifications goroutine,
+	// which reads directly from the internal channel.
+	// We return the channel directly.
+	// The context handling is implicitly done by the caller (handleNotifications).
+	// NOTE: This assumes only one subscriber (handleNotifications).
+	// If multiple subscribers were needed, a fan-out mechanism would be required.
+	return s.notifications
+}
+
 var _ ClientSession = (*stdioSession)(nil)
 
 var stdioSessionInstance = stdioSession{

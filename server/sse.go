@@ -39,7 +39,15 @@ func (c *sseConnection) close() {
 type SSESession interface {
 	ClientSession
 
-	EventQueue() chan string
+	// PublishEvent sends an event string (intended for the client) to the session's backing store.
+	// This might involve writing to a channel, publishing to Redis, etc.
+	// It should be non-blocking or handle backpressure appropriately.
+	PublishEvent(ctx context.Context, event string) error
+
+	// SubscribeEvents returns a read-only channel that delivers events for this session.
+	// The provided context should be used to signal when the subscription is no longer needed.
+	// The implementer is responsible for closing the channel when the context is done.
+	SubscribeEvents(ctx context.Context) <-chan string
 }
 
 // SSEContextFunc is a function that takes an existing context and the current
@@ -164,10 +172,13 @@ type SSESessionStore interface {
 
 // defaultSession represents a logical client session.
 type defaultSession struct {
-	sessionID           string
-	notificationChannel chan mcp.JSONRPCNotification
-	eventQueue          chan string // Channel for queuing events specific to this connection
-	initialized         atomic.Bool
+	sessionID string
+	// Internal channels for the default in-memory implementation
+	notificationChan chan mcp.JSONRPCNotification
+	eventChan        chan string
+	initialized      atomic.Bool
+	closeOnce        sync.Once
+	closed           chan struct{} // To signal subscribers to stop
 }
 
 func (cs *defaultSession) SessionID() string {
@@ -175,11 +186,11 @@ func (cs *defaultSession) SessionID() string {
 }
 
 func (cs *defaultSession) NotificationChannel() chan mcp.JSONRPCNotification {
-	return cs.notificationChannel
+	return cs.notificationChan
 }
 
 func (cs *defaultSession) EventQueue() chan string {
-	return cs.eventQueue
+	return cs.eventChan
 }
 
 func (cs *defaultSession) Initialize() {
@@ -188,6 +199,67 @@ func (cs *defaultSession) Initialize() {
 
 func (cs *defaultSession) Initialized() bool {
 	return cs.initialized.Load()
+}
+
+func (cs *defaultSession) PublishNotification(ctx context.Context, notification mcp.JSONRPCNotification) error {
+	select {
+	case <-cs.closed:
+		return fmt.Errorf("session %s closed", cs.sessionID)
+	case cs.notificationChan <- notification:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+		// Non-blocking attempt, return error if full
+		return fmt.Errorf("notification channel full for session %s", cs.sessionID)
+	}
+}
+
+func (cs *defaultSession) PublishEvent(ctx context.Context, event string) error {
+	select {
+	case <-cs.closed:
+		return fmt.Errorf("session %s closed", cs.sessionID)
+	case cs.eventChan <- event:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+		// Non-blocking attempt, return error if full
+		return fmt.Errorf("event channel full for session %s", cs.sessionID)
+	}
+}
+
+// SubscribeNotifications returns the internal channel.
+// NOTE: This simple implementation doesn't handle multiple subscribers well if the
+// underlying channel is closed by one. A more robust version might use a fan-out pattern.
+func (cs *defaultSession) SubscribeNotifications(ctx context.Context) <-chan mcp.JSONRPCNotification {
+	// Return the direct channel for the in-memory version.
+	// The goroutine watching ctx.Done() is implicitly the one calling this method (in handleSSE).
+	return cs.notificationChan
+}
+
+// SubscribeEvents returns the internal channel.
+func (cs *defaultSession) SubscribeEvents(ctx context.Context) <-chan string {
+	// Return the direct channel for the in-memory version.
+	return cs.eventChan
+}
+
+// Close cleans up the default session resources (closes channels).
+func (cs *defaultSession) Close() {
+	cs.closeOnce.Do(func() {
+		close(cs.closed) // Signal subscribers
+		// Drain and close channels to prevent blocking publishes after close
+		go func() {
+			for range cs.notificationChan {
+			}
+		}()
+		close(cs.notificationChan)
+		go func() {
+			for range cs.eventChan {
+			}
+		}()
+		close(cs.eventChan)
+	})
 }
 
 type defaultSseSessionStore struct {
@@ -201,12 +273,14 @@ func NewDefaultSSESessionStore() *defaultSseSessionStore {
 }
 
 func (d *defaultSseSessionStore) CreateSession(sessionID string) SSESession {
-	return &defaultSession{
-		sessionID:           sessionID,
-		notificationChannel: make(chan mcp.JSONRPCNotification, 100),
-		eventQueue:          make(chan string, 100),
-		initialized:         atomic.Bool{},
+	ds := &defaultSession{
+		sessionID:        sessionID,
+		notificationChan: make(chan mcp.JSONRPCNotification, 100),
+		eventChan:        make(chan string, 100),
+		initialized:      atomic.Bool{},
+		closed:           make(chan struct{}),
 	}
+	return ds
 }
 
 func (d *defaultSseSessionStore) Load(sessionID string) (SSESession, bool) {
@@ -214,7 +288,7 @@ func (d *defaultSseSessionStore) Load(sessionID string) (SSESession, bool) {
 	if !ok {
 		return nil, false
 	}
-	session := sessionI.(*defaultSession)
+	session := sessionI.(SSESession)
 	return session, true
 }
 
@@ -223,7 +297,7 @@ func (d *defaultSseSessionStore) LoadAndDelete(sessionID string) (ClientSession,
 	if !loaded {
 		return nil, false
 	}
-	session := sessionI.(*defaultSession)
+	session := sessionI.(SSESession)
 	return session, true
 }
 
@@ -348,17 +422,18 @@ func (s *SSEServer) handleSSE(w http.ResponseWriter, r *http.Request) {
 
 	// Defer cleanup for this connection handler
 	defer func() {
-		// When the connection handler exits, signal connection closure,
-		// clear the active connection reference in the session,
-		// remove the session from the map, and unregister from MCPServer.
-		connection.close()
-		s.connections.Delete(sessionID)
+		// Signal connection closure (if still using connection.done)
+		connection.close()              // Consider removing sseConnection entirely if not needed
+		s.connections.Delete(sessionID) // Remove the specific connection tracking
+
 		// Use context.Background() for unregistration if request context might be done.
+		// Unregister the *logical* session
 		s.server.UnregisterSession(context.Background(), sessionID)
 	}()
 
 	// Register the logical session with the MCPServer
-	// The context here is the request context, tied to the connection lifetime.
+	// Pass the request context, tied to the connection lifetime.
+	// MCPServer uses this context for its hooks if needed.
 	if err := s.server.RegisterSession(r.Context(), session); err != nil {
 		http.Error(w, fmt.Sprintf("Session registration failed: %v", err), http.StatusInternalServerError)
 		// If registration fails after storing, remove from map before returning.
@@ -369,31 +444,25 @@ func (s *SSEServer) handleSSE(w http.ResponseWriter, r *http.Request) {
 	// Note: The defer above handles UnregisterSession and other cleanup on normal exit.
 
 	// Start notification handler for this session, sending to the active connection
+	// This goroutine now publishes notifications *to* the session store.
 	go func() {
-		connDone := connection.done      // Cache connection's done channel
-		reqCtxDone := r.Context().Done() // Cache request context's done channel
+		// Subscribe directly to the session's notification source
+		notificationSubChan := session.SubscribeNotifications(r.Context())
+		reqCtxDone := r.Context().Done()
 
 		for {
 			select {
-			case notification, ok := <-session.NotificationChannel():
+			case notification, ok := <-notificationSubChan:
 				if !ok {
-					// Should not happen with current setup, but good practice
+					// Session closed or context cancelled
 					return
 				}
-				eventData, err := json.Marshal(notification)
-				if err == nil {
-					// Queue event for the specific connection
-					select {
-					case session.EventQueue() <- fmt.Sprintf("event: message\ndata: %s\n\n", eventData):
-					default:
-						// Log or handle queue failure (e.g., queue full, connection closing)
-					}
-				} else {
-					// Log marshalling error
+				// Publish the notification via the session's mechanism
+				if err := session.PublishNotification(r.Context(), notification); err != nil {
+					// Log or handle publish failure (e.g., session closed, Redis down)
 				}
-			case <-connDone: // Listen to connection close signal
-				return
-			case <-reqCtxDone: // Also listen to request context cancellation
+			case <-reqCtxDone:
+				// Client disconnected (request context cancelled)
 				return
 			}
 		}
@@ -402,15 +471,14 @@ func (s *SSEServer) handleSSE(w http.ResponseWriter, r *http.Request) {
 	// Start keep alive : ping for this connection
 	if s.keepAlive {
 		go func() {
+			// Ticker for interval
 			ticker := time.NewTicker(s.keepAliveInterval)
 			defer ticker.Stop()
-			connDone := connection.done      // Cache connection's done channel
-			reqCtxDone := r.Context().Done() // Cache request context's done channel
 
 			for {
 				select {
 				case <-ticker.C:
-					// Get the currently active connection for this session
+					// Create ping message
 					message := mcp.JSONRPCRequest{
 						JSONRPC: "2.0",
 						ID:      connection.requestID.Add(1), // Use connection's requestID
@@ -418,17 +486,21 @@ func (s *SSEServer) handleSSE(w http.ResponseWriter, r *http.Request) {
 							Method: "ping",
 						},
 					}
-					messageBytes, _ := json.Marshal(message) // Error handling omitted for ping
-					pingMsg := fmt.Sprintf("event: message\ndata:%s\n\n", messageBytes)
-					select {
-					case session.EventQueue() <- pingMsg:
-					default:
-						// Log or handle failure (e.g., connection closing)
-						return // Stop trying if queue fails
+					// Marshal and format as SSE event
+					messageBytes, err := json.Marshal(message)
+					if err != nil {
+						// Log marshalling error for ping
+						continue
 					}
-				case <-connDone: // Listen to connection close signal
+					pingMsg := fmt.Sprintf("event: message\ndata: %s\n\n", messageBytes)
+					// Publish the ping event via the session
+					if err := session.PublishEvent(r.Context(), pingMsg); err != nil {
+						// Log or handle publish failure (e.g., session closed, Redis down)
+						return // Stop trying if publish fails
+					}
+				case <-connection.done: // Listen to connection close signal
 					return
-				case <-reqCtxDone: // Also listen to request context cancellation
+				case <-r.Context().Done(): // Also listen to request context cancellation
 					return
 				}
 			}
@@ -440,16 +512,19 @@ func (s *SSEServer) handleSSE(w http.ResponseWriter, r *http.Request) {
 	connection.flusher.Flush()
 
 	// Main event loop for this connection
-	connDone := connection.done      // Cache connection's done channel
+	// Subscribe to events *from* the session store
+	eventSubChan := session.SubscribeEvents(r.Context())
 	reqCtxDone := r.Context().Done() // Cache request context's done channel
+
 	for {
 		select {
-		case event, ok := <-session.EventQueue():
+		case event, ok := <-eventSubChan:
 			if !ok {
-				// eventQueue closed, likely means connection is closing
+				// Subscription channel closed (e.g., context cancelled, session deleted)
 				return
 			}
-			// Write the event to the response
+			// Write the event received from the subscription to the HTTP response
+			// Assume `event` is already correctly formatted SSE string
 			if _, err := fmt.Fprint(connection.writer, event); err != nil {
 				// Error writing to client, likely disconnected
 				return // Exit loop, defer will handle cleanup
@@ -458,7 +533,7 @@ func (s *SSEServer) handleSSE(w http.ResponseWriter, r *http.Request) {
 		case <-reqCtxDone:
 			// Client disconnected (request context cancelled)
 			return // Exit loop, defer will handle cleanup
-		case <-connDone:
+		case <-connection.done:
 			// Connection explicitly closed (e.g., by shutdown)
 			return // Exit loop, defer will handle cleanup
 		}
@@ -517,15 +592,16 @@ func (s *SSEServer) handleMessage(w http.ResponseWriter, r *http.Request) {
 	// Only send response if there is one (not for notifications)
 	if response != nil {
 		// Get the active connection associated with the session *at this moment*.
-		eventData, err := json.Marshal(response)
+		responseData, err := json.Marshal(response)
 		// Handle potential marshalling error
 		if err != nil {
-			// Log marshalling error - This response won't be sent via SSE
+			s.writeJSONRPCError(w, nil, mcp.INTERNAL_ERROR, "Failed to marshal response")
+			// Log marshalling error - This response won't be sent via SSE either
 		} else {
-			select {
-			case session.EventQueue() <- fmt.Sprintf("event: message\ndata: %s\n\n", eventData):
-			default:
-				// Log error: Failed to queue SSE response (queue full or connection closed)
+			// Format as SSE event and publish via the session
+			sseEvent := fmt.Sprintf("event: message\ndata: %s\n\n", responseData)
+			if pubErr := session.PublishEvent(ctx, sseEvent); pubErr != nil {
+				// Log error: Failed to publish SSE response (e.g., session closed, Redis down)
 			}
 		}
 
@@ -579,13 +655,12 @@ func (s *SSEServer) SendEventToSession(
 		return fmt.Errorf("failed to marshal event: %w", err)
 	}
 
-	// Queue the event for sending via the specific SSE connection
-	select {
-	case session.EventQueue() <- fmt.Sprintf("event: message\ndata: %s\n\n", eventData):
-	default:
-		return fmt.Errorf("event queue full for connection associated with session %s", sessionID)
-	}
-	return nil
+	// Format as SSE event and publish via the session
+	// Use context.Background() or a short timeout context for this server-initiated push
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second) // Example timeout
+	defer cancel()
+	sseEvent := fmt.Sprintf("event: message\ndata: %s\n\n", eventData)
+	return session.PublishEvent(ctx, sseEvent)
 }
 
 func (s *SSEServer) GetUrlPath(input string) (string, error) {

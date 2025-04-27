@@ -56,8 +56,12 @@ type ClientSession interface {
 	Initialize()
 	// Initialized returns if session is ready to accept notifications
 	Initialized() bool
-	// NotificationChannel provides a channel suitable for sending notifications to client.
-	NotificationChannel() chan mcp.JSONRPCNotification
+	// PublishNotification sends a JSON-RPC notification to the session's backing store.
+	// Implementations should handle marshalling and potential errors (e.g., queue full, Redis down).
+	PublishNotification(ctx context.Context, notification mcp.JSONRPCNotification) error
+	// SubscribeNotifications returns a read-only channel that delivers notifications for this session.
+	// The provided context signals when the subscription is no longer needed.
+	SubscribeNotifications(ctx context.Context) <-chan mcp.JSONRPCNotification
 	// SessionID is a unique identifier used to track user session.
 	SessionID() string
 }
@@ -200,6 +204,7 @@ type MCPServer struct {
 	capabilities           serverCapabilities
 	paginationLimit        *int
 	sessionStore           SessionStore
+	sessionNotifier        *SessionNotifier
 	hooks                  *Hooks
 }
 
@@ -245,6 +250,7 @@ func (s *MCPServer) RegisterSession(
 	if _, exists := s.sessionStore.LoadOrStore(sessionID, session); exists {
 		return fmt.Errorf("session %s is already registered", sessionID)
 	}
+	s.sessionNotifier.Register(sessionID, session.PublishNotification)
 	s.hooks.RegisterSession(ctx, session)
 	return nil
 }
@@ -256,13 +262,15 @@ func (s *MCPServer) UnregisterSession(
 ) {
 	session, loaded := s.sessionStore.LoadAndDelete(sessionID)
 	if loaded {
+		s.sessionNotifier.Unregister(sessionID)
 		s.hooks.UnregisterSession(ctx, session)
 	}
 }
 
-// SendNotificationToClient sends a notification to the current client
-func (s *MCPServer) SendNotificationToClient(
+// SendNotificationToSession sends a notification to a specific client session.
+func (s *MCPServer) SendNotificationToSession(
 	ctx context.Context,
+	sessionID string,
 	method string,
 	params map[string]any,
 ) error {
@@ -281,12 +289,7 @@ func (s *MCPServer) SendNotificationToClient(
 		},
 	}
 
-	select {
-	case session.NotificationChannel() <- notification:
-		return nil
-	default:
-		return fmt.Errorf("notification channel full or blocked")
-	}
+	return s.sessionNotifier.Notify(ctx, sessionID, notification)
 }
 
 // serverCapabilities defines the supported features of the MCP server
@@ -407,6 +410,7 @@ func NewMCPServer(
 		name:                 name,
 		version:              version,
 		notificationHandlers: make(map[string]NotificationHandlerFunc),
+		sessionNotifier:      NewSessionNotifier(),
 		capabilities: serverCapabilities{
 			tools:     nil,
 			resources: nil,
@@ -938,3 +942,43 @@ func createErrorResponse(
 		},
 	}
 }
+
+// --- SessionNotifier --- (Helper for targeted notifications)
+
+type SessionNotifier struct {
+	mu         sync.RWMutex
+	publishers map[string]func(context.Context, mcp.JSONRPCNotification) error
+}
+
+func NewSessionNotifier() *SessionNotifier {
+	return &SessionNotifier{
+		publishers: make(map[string]func(context.Context, mcp.JSONRPCNotification) error),
+	}
+}
+
+func (sn *SessionNotifier) Register(sessionID string, publisher func(context.Context, mcp.JSONRPCNotification) error) {
+	sn.mu.Lock()
+	defer sn.mu.Unlock()
+	sn.publishers[sessionID] = publisher
+}
+
+func (sn *SessionNotifier) Unregister(sessionID string) {
+	sn.mu.Lock()
+	defer sn.mu.Unlock()
+	delete(sn.publishers, sessionID)
+}
+
+func (sn *SessionNotifier) Notify(ctx context.Context, sessionID string, notification mcp.JSONRPCNotification) error {
+	sn.mu.RLock()
+	publisher, ok := sn.publishers[sessionID]
+	sn.mu.RUnlock()
+
+	if !ok {
+		return fmt.Errorf("no publisher registered for session %s", sessionID)
+	}
+
+	// Call the session's specific PublishNotification method
+	return publisher(ctx, notification)
+}
+
+// --- End SessionNotifier ---
