@@ -63,11 +63,11 @@ func (s *stdioSession) NotificationChannel() chan mcp.JSONRPCNotification {
 	return s.notifications
 }
 
-func (s *stdioSession) Initialize() {
+func (s *stdioSession) Initialize(ctx context.Context) {
 	s.initialized.Store(true)
 }
 
-func (s *stdioSession) Initialized() bool {
+func (s *stdioSession) Initialized(ctx context.Context) bool {
 	return s.initialized.Load()
 }
 
