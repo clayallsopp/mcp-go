@@ -166,8 +166,8 @@ func WithSSEContextFunc(fn SSEContextFunc) SSEOption {
 
 type SSESessionStore interface {
 	SessionStore
-	CreateSession(sessionID string) SSESession
-	Load(sessionID string) (SSESession, bool)
+	CreateSession(ctx context.Context, sessionID string) SSESession
+	Load(ctx context.Context, sessionID string) (SSESession, bool)
 }
 
 // defaultSession represents a logical client session.
@@ -193,11 +193,11 @@ func (cs *defaultSession) EventQueue() chan string {
 	return cs.eventChan
 }
 
-func (cs *defaultSession) Initialize() {
+func (cs *defaultSession) Initialize(ctx context.Context) {
 	cs.initialized.Store(true)
 }
 
-func (cs *defaultSession) Initialized() bool {
+func (cs *defaultSession) Initialized(ctx context.Context) bool {
 	return cs.initialized.Load()
 }
 
@@ -272,7 +272,7 @@ func NewDefaultSSESessionStore() *defaultSseSessionStore {
 	}
 }
 
-func (d *defaultSseSessionStore) CreateSession(sessionID string) SSESession {
+func (d *defaultSseSessionStore) CreateSession(ctx context.Context, sessionID string) SSESession {
 	ds := &defaultSession{
 		sessionID:        sessionID,
 		notificationChan: make(chan mcp.JSONRPCNotification, 100),
@@ -283,7 +283,7 @@ func (d *defaultSseSessionStore) CreateSession(sessionID string) SSESession {
 	return ds
 }
 
-func (d *defaultSseSessionStore) Load(sessionID string) (SSESession, bool) {
+func (d *defaultSseSessionStore) Load(ctx context.Context, sessionID string) (SSESession, bool) {
 	sessionI, ok := d.sessions.Load(sessionID)
 	if !ok {
 		return nil, false
@@ -292,7 +292,7 @@ func (d *defaultSseSessionStore) Load(sessionID string) (SSESession, bool) {
 	return session, true
 }
 
-func (d *defaultSseSessionStore) LoadAndDelete(sessionID string) (ClientSession, bool) {
+func (d *defaultSseSessionStore) LoadAndDelete(ctx context.Context, sessionID string) (ClientSession, bool) {
 	sessionI, loaded := d.sessions.LoadAndDelete(sessionID)
 	if !loaded {
 		return nil, false
@@ -301,7 +301,7 @@ func (d *defaultSseSessionStore) LoadAndDelete(sessionID string) (ClientSession,
 	return session, true
 }
 
-func (d *defaultSseSessionStore) LoadOrStore(sessionID string, session ClientSession) (ClientSession, bool) {
+func (d *defaultSseSessionStore) LoadOrStore(ctx context.Context, sessionID string, session ClientSession) (ClientSession, bool) {
 	sessionI, loaded := d.sessions.LoadOrStore(sessionID, session)
 	if !loaded {
 		return nil, false
@@ -387,6 +387,7 @@ func (s *SSEServer) Shutdown(ctx context.Context) error {
 // handleSSE handles incoming SSE connection requests.
 // It sets up appropriate headers and creates a new session for the client.
 func (s *SSEServer) handleSSE(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
 	if r.Method != http.MethodGet {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
@@ -406,7 +407,7 @@ func (s *SSEServer) handleSSE(w http.ResponseWriter, r *http.Request) {
 	sessionID := uuid.New().String()
 
 	// Create the logical session
-	session := s.sessionStore.CreateSession(sessionID)
+	session := s.sessionStore.CreateSession(ctx, sessionID)
 
 	// Create the connection associated with this request
 	connection := &sseConnection{
@@ -434,7 +435,7 @@ func (s *SSEServer) handleSSE(w http.ResponseWriter, r *http.Request) {
 	// Register the logical session with the MCPServer
 	// Pass the request context, tied to the connection lifetime.
 	// MCPServer uses this context for its hooks if needed.
-	if err := s.server.RegisterSession(r.Context(), session); err != nil {
+	if err := s.server.RegisterSession(ctx, session); err != nil {
 		http.Error(w, fmt.Sprintf("Session registration failed: %v", err), http.StatusInternalServerError)
 		// If registration fails after storing, remove from map before returning.
 		s.connections.Delete(sessionID)
@@ -447,8 +448,8 @@ func (s *SSEServer) handleSSE(w http.ResponseWriter, r *http.Request) {
 	// This goroutine now publishes notifications *to* the session store.
 	go func() {
 		// Subscribe directly to the session's notification source
-		notificationSubChan := session.SubscribeNotifications(r.Context())
-		reqCtxDone := r.Context().Done()
+		notificationSubChan := session.SubscribeNotifications(ctx)
+		reqCtxDone := ctx.Done()
 
 		for {
 			select {
@@ -458,7 +459,7 @@ func (s *SSEServer) handleSSE(w http.ResponseWriter, r *http.Request) {
 					return
 				}
 				// Publish the notification via the session's mechanism
-				if err := session.PublishNotification(r.Context(), notification); err != nil {
+				if err := session.PublishNotification(ctx, notification); err != nil {
 					// Log or handle publish failure (e.g., session closed, Redis down)
 				}
 			case <-reqCtxDone:
@@ -494,13 +495,13 @@ func (s *SSEServer) handleSSE(w http.ResponseWriter, r *http.Request) {
 					}
 					pingMsg := fmt.Sprintf("event: message\ndata: %s\n\n", messageBytes)
 					// Publish the ping event via the session
-					if err := session.PublishEvent(r.Context(), pingMsg); err != nil {
+					if err := session.PublishEvent(ctx, pingMsg); err != nil {
 						// Log or handle publish failure (e.g., session closed, Redis down)
 						return // Stop trying if publish fails
 					}
 				case <-connection.done: // Listen to connection close signal
 					return
-				case <-r.Context().Done(): // Also listen to request context cancellation
+				case <-ctx.Done(): // Also listen to request context cancellation
 					return
 				}
 			}
@@ -513,8 +514,8 @@ func (s *SSEServer) handleSSE(w http.ResponseWriter, r *http.Request) {
 
 	// Main event loop for this connection
 	// Subscribe to events *from* the session store
-	eventSubChan := session.SubscribeEvents(r.Context())
-	reqCtxDone := r.Context().Done() // Cache request context's done channel
+	eventSubChan := session.SubscribeEvents(ctx)
+	reqCtxDone := ctx.Done() // Cache request context's done channel
 
 	for {
 		select {
@@ -553,6 +554,7 @@ func (s *SSEServer) GetMessageEndpointForClient(sessionID string) string {
 // handleMessage processes incoming JSON-RPC messages from clients and sends responses
 // back through both the SSE connection and HTTP response.
 func (s *SSEServer) handleMessage(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
 	if r.Method != http.MethodPost {
 		s.writeJSONRPCError(w, nil, mcp.INVALID_REQUEST, "Method not allowed")
 		return
@@ -564,7 +566,7 @@ func (s *SSEServer) handleMessage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	session, ok := s.sessionStore.Load(sessionID)
+	session, ok := s.sessionStore.Load(ctx, sessionID)
 	if !ok {
 		// It's possible the session timed out or disconnected between getting the
 		// endpoint and sending the message.
@@ -574,7 +576,7 @@ func (s *SSEServer) handleMessage(w http.ResponseWriter, r *http.Request) {
 
 	// Set the client context using the logical session before handling the message
 	// Use the request's context as the base.
-	ctx := s.server.WithContext(r.Context(), session)
+	ctx = s.server.WithContext(ctx, session)
 	if s.contextFunc != nil {
 		ctx = s.contextFunc(ctx, r)
 	}
@@ -642,10 +644,11 @@ func (s *SSEServer) writeJSONRPCError(
 // SendEventToSession sends an event to a specific SSE session identified by sessionID.
 // Returns an error if the session is not found or has no active connection.
 func (s *SSEServer) SendEventToSession(
+	ctx context.Context,
 	sessionID string,
 	event interface{},
 ) error {
-	session, ok := s.sessionStore.Load(sessionID)
+	session, ok := s.sessionStore.Load(ctx, sessionID)
 	if !ok {
 		return fmt.Errorf("session not found: %s", sessionID)
 	}
@@ -657,7 +660,7 @@ func (s *SSEServer) SendEventToSession(
 
 	// Format as SSE event and publish via the session
 	// Use context.Background() or a short timeout context for this server-initiated push
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second) // Example timeout
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second) // Example timeout
 	defer cancel()
 	sseEvent := fmt.Sprintf("event: message\ndata: %s\n\n", eventData)
 	return session.PublishEvent(ctx, sseEvent)

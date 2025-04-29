@@ -1184,10 +1184,10 @@ func (f fakeSession) NotificationChannel() chan mcp.JSONRPCNotification {
 	return f.notificationChannel
 }
 
-func (f fakeSession) Initialize() {
+func (f fakeSession) Initialize(ctx context.Context) {
 }
 
-func (f fakeSession) Initialized() bool {
+func (f fakeSession) Initialized(ctx context.Context) bool {
 	return f.initialized
 }
 

@@ -53,9 +53,9 @@ type ServerTool struct {
 // ClientSession represents an active session that can be used by MCPServer to interact with client.
 type ClientSession interface {
 	// Initialize marks session as fully initialized and ready for notifications
-	Initialize()
+	Initialize(ctx context.Context)
 	// Initialized returns if session is ready to accept notifications
-	Initialized() bool
+	Initialized(ctx context.Context) bool
 	// PublishNotification sends a JSON-RPC notification to the session's backing store.
 	// Implementations should handle marshalling and potential errors (e.g., queue full, Redis down).
 	PublishNotification(ctx context.Context, notification mcp.JSONRPCNotification) error
@@ -145,9 +145,9 @@ type NotificationHandlerFunc func(ctx context.Context, notification mcp.JSONRPCN
 // SessionStore defines the interface for managing client sessions.
 type SessionStore interface {
 	// LoadOrStore stores a session if the key is not present, otherwise returns the existing session.
-	LoadOrStore(key string, value ClientSession) (actual ClientSession, loaded bool)
+	LoadOrStore(ctx context.Context, key string, value ClientSession) (actual ClientSession, loaded bool)
 	// LoadAndDelete deletes the session for a key, returning the previous value if any.
-	LoadAndDelete(key string) (value ClientSession, loaded bool)
+	LoadAndDelete(ctx context.Context, key string) (value ClientSession, loaded bool)
 }
 
 // defaultSessionStore is the default implementation of SessionStore using sync.Map.
@@ -156,7 +156,7 @@ type DefaultSessionStore struct {
 }
 
 // LoadOrStore implements the SessionStore interface.
-func (d *DefaultSessionStore) LoadOrStore(key string, value ClientSession) (ClientSession, bool) {
+func (d *DefaultSessionStore) LoadOrStore(ctx context.Context, key string, value ClientSession) (ClientSession, bool) {
 	actual, loaded := d.sessions.LoadOrStore(key, value)
 	if actual == nil {
 		return nil, loaded // Handle nil case if LoadOrStore returns nil interface
@@ -165,7 +165,7 @@ func (d *DefaultSessionStore) LoadOrStore(key string, value ClientSession) (Clie
 }
 
 // LoadAndDelete implements the SessionStore interface.
-func (d *DefaultSessionStore) LoadAndDelete(key string) (ClientSession, bool) {
+func (d *DefaultSessionStore) LoadAndDelete(ctx context.Context, key string) (ClientSession, bool) {
 	value, loaded := d.sessions.LoadAndDelete(key)
 	if !loaded || value == nil {
 		return nil, false
@@ -247,7 +247,7 @@ func (s *MCPServer) RegisterSession(
 	session ClientSession,
 ) error {
 	sessionID := session.SessionID()
-	if _, exists := s.sessionStore.LoadOrStore(sessionID, session); exists {
+	if _, exists := s.sessionStore.LoadOrStore(ctx, sessionID, session); exists {
 		return fmt.Errorf("session %s is already registered", sessionID)
 	}
 	s.sessionNotifier.Register(sessionID, session.PublishNotification)
@@ -260,7 +260,7 @@ func (s *MCPServer) UnregisterSession(
 	ctx context.Context,
 	sessionID string,
 ) {
-	session, loaded := s.sessionStore.LoadAndDelete(sessionID)
+	session, loaded := s.sessionStore.LoadAndDelete(ctx, sessionID)
 	if loaded {
 		s.sessionNotifier.Unregister(sessionID)
 		s.hooks.UnregisterSession(ctx, session)
@@ -275,7 +275,7 @@ func (s *MCPServer) SendNotificationToSession(
 	params map[string]any,
 ) error {
 	session := ClientSessionFromContext(ctx)
-	if session == nil || !session.Initialized() {
+	if session == nil || !session.Initialized(ctx) {
 		return fmt.Errorf("notification channel not initialized")
 	}
 
@@ -583,7 +583,7 @@ func (s *MCPServer) handleInitialize(
 	}
 
 	if session := ClientSessionFromContext(ctx); session != nil {
-		session.Initialize()
+		session.Initialize(ctx)
 	}
 	return &result, nil
 }
