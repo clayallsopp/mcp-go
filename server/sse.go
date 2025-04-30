@@ -444,6 +444,12 @@ func (s *SSEServer) handleSSE(w http.ResponseWriter, r *http.Request) {
 	}
 	// Note: The defer above handles UnregisterSession and other cleanup on normal exit.
 
+	// Set the client context using the logical session before prcoeeding
+	// Use the request's context as the base.
+	if s.contextFunc != nil {
+		ctx = s.contextFunc(ctx, r)
+	}
+
 	// Start notification handler for this session, sending to the active connection
 	// This goroutine now publishes notifications *to* the session store.
 	go func() {
